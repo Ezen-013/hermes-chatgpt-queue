@@ -5,7 +5,7 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 const { host, Button, Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Popover, PopoverTrigger, PopoverContent, useComposerSession, Codicon, useValue } = sdk
 
 const ID = 'chatgpt-window-queue'
-const EDITION = '纯文字版 · v3.0.0'
+const EDITION = '纯文字版 · v3.0.1'
 const PROVIDER = 'openai-codex'
 const MIN = 60000
 const MAX_TEXT = 24000
@@ -123,9 +123,46 @@ function addJob(state, job) {
 
 const withoutBody = ({ text, draft, ...rest }) => rest
 const rowText = row => typeof row?.text === 'string' && !row.truncated ? row.text : null
-const latestUser = snapshot => snapshot?.rows?.filter(r => r.role === 'user' && r.row_kind === 'message').at(-1)
 const validText = text => typeof text === 'string' && text.trim().length > 0 && text.length <= MAX_TEXT
 const idOf = row => Number.isSafeInteger(row?.row_id) && row.row_id > 0 ? row.row_id : null
+const RETRY_PAGE_ROWS = 16
+const RETRY_MAX_PAGES = 8
+
+// Latest-order pages go backward, but rows within each page are in display order.
+// A tool-heavy turn may span several pages. Stop at the first page with a user
+// message (even if hidden or unusable), not at the first page with the expected ID.
+async function readLatestUser(io, route, session) {
+  const unreadable = () => softError('未能完整核对原会话的最近用户消息；未发送。')
+  const read = async cursor => {
+    const page = await io.call(route, 'session.transcript', {
+      session_id: session, order: 'latest', limit: RETRY_PAGE_ROWS, ...(cursor ? { cursor } : {}),
+    })
+    if (!Array.isArray(page?.rows) || page.rows.some(row => !row || typeof row !== 'object') ||
+      (page.session_id != null && page.session_id !== session) || (cursor && page.reset === true) ||
+      (page.next_cursor != null && (typeof page.next_cursor !== 'string' || !page.next_cursor))) throw unreadable()
+    return page
+  }
+  const shape = page => JSON.stringify([page.next_cursor ?? null,
+    page.rows.map(row => [row.row_id, row.role, row.row_kind, row.display_kind])])
+  let cursor = null, head = null
+  const seen = new Set()
+  for (let n = 0; n < RETRY_MAX_PAGES; n++) {
+    const page = await read(cursor)
+    if (n === 0) head = shape(page)
+    const row = page.rows.findLast(r => r.role === 'user' && r.row_kind === 'message')
+    const next = page.next_cursor ?? null
+    if (row || !next) {
+      // Separate RPCs are not one snapshot. If the head moved while following
+      // older pages, do not approve a stale user row or infer it was superseded.
+      if (n > 0 && shape(await read(null)) !== head) throw unreadable()
+      return row ?? null
+    }
+    if (seen.has(next)) throw unreadable()
+    seen.add(next)
+    cursor = next
+  }
+  throw unreadable()
+}
 const profileMatch = (tag, route) => !tag || tag === route.profile || tag === route.targetProfile
 const expectedModel = (info, job) => info?.provider === PROVIDER && info?.model === job.model
 const canonical = snap => snap?.info?.desktop_protocol === 'hermes-gateway-v1'
@@ -185,8 +222,8 @@ export function createScheduler({ io, storage, locks, now = dateNow, notify = ()
           if (blocked) throw softError('Hermes 仍报告账号受限或账号归属不明确；未自动发送。')
         }
         if (job.kind === 'retry') {
-          const trail = await io.call(route, 'session.transcript', { session_id: stored, order: 'latest', limit: 16 })
-          if (idOf(latestUser(trail)) !== job.userRow) {
+          const row = await readLatestUser(io, route, stored)
+          if (idOf(row) !== job.userRow) {
             await settle('superseded', '额度中断后又有用户消息，或原消息已不在可核对的历史中。')
             return false
           }
@@ -317,8 +354,7 @@ export function createQuotaObserver({ io, scheduler, lookup, active, now = dateN
       try {
         const info = await io.call(route, 'session.info', { session_id: ev.session_id })
         if (info?.provider !== PROVIDER || info.model !== s.model || info.yolo || info.archived) return false
-        const history = await io.call(route, 'session.transcript', { session_id: session, order: 'latest', limit: 16 })
-        const row = latestUser(history), text = rowText(row)
+        const row = await readLatestUser(io, route, session), text = rowText(row)
         if (idOf(row) !== userRow || !validText(text) || row.display_kind === 'hidden' || !active()) return false
         let account = quotaView(await io.call(route, 'model.options', { session_id: ev.session_id }))
         let due = eligibleQuotaError(p, account, now())

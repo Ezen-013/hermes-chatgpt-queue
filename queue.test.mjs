@@ -159,6 +159,65 @@ test('manual setting gates auto scheduling; quota replay and duplicates are dedu
   await a.tick(); assert.equal(sendCalls(h).length,1)
   assert.equal(sendCalls(h)[0][2].display_kind,'hidden'); assert.notEqual(sendCalls(h)[0][2].text,'some prompt')
 })
+const completeEvent = {session_id:'runtime',connectionId:'local',profile:'fixture-profile',payload}
+const toolRows = n => Array.from({length:16},(_,i)=>({row_id:n+i,role:'tool',row_kind:'message'}))
+const observeQuota = (h,scheduler) => createQuotaObserver({io:h.io,scheduler,now:()=>h.now,
+  lookup:async()=>({route,session:'stored'}),active:()=>true,pause:async()=>{},notify:()=>{}})
+const readCursors = h => h.calls.filter(c=>c[1]==='session.transcript').map(c=>c[2].cursor ?? null)
+const quotaHarness = read => createHarness({'session.transcript':read,'model.options':inventory([win('Session')])})
+
+test('429 after multiple tool rounds finds the original user on page three, then auto-continues once',async()=>{
+  const h=quotaHarness((r,m,{cursor})=>({session_id:'stored',reset:!cursor,...(!cursor
+    ? {rows:toolRows(100),next_cursor:'p2'} : cursor==='p2'
+    ? {rows:[{role:'user',row_kind:'compaction'},...toolRows(84)],next_cursor:'p3'}
+    : {rows:[user(),...toolRows(60)],next_cursor:'not-needed'})}))
+  const a=h.getScheduler(); await a.enable(true); await a.tick(base)
+  const observe=observeQuota(h,a)
+  assert.deepEqual(await Promise.all([observe(completeEvent),observe(completeEvent)]),[true,false])
+  assert.deepEqual(readCursors(h),[null,'p2','p3',null])
+  assert.deepEqual((await a.read()).jobs.map(j=>[j.kind,j.status,j.userRow,j.due]),[['retry','pending',42,due+M]])
+  h.answers['model.options']=inventory([win('Session',0,due+5*60*M)])
+  h.now=due+M-3000; await a.tick(); assert.equal(sendCalls(h).length,0)
+  h.now=due+M; await a.tick(); await a.tick()
+  assert.deepEqual(readCursors(h),[null,'p2','p3',null,null,'p2','p3',null])
+  assert.equal(sendCalls(h).length,1)
+  assert.deepEqual(sendCalls(h)[0][0],route); assert.equal(sendCalls(h)[0][2].session_id,'runtime')
+  assert.equal(sendCalls(h)[0][2].display_kind,'hidden'); assert.equal((await a.read()).jobs[0].status,'sent')
+})
+
+test('a newer user message, even hidden, is not skipped to reach the old request',async()=>{
+  const h=quotaHarness((r,m,{cursor})=>cursor?{rows:[user()],next_cursor:null}
+    :{rows:toolRows(100),next_cursor:'p2'})
+  const a=h.getScheduler(); await a.enable(true); await a.tick(base)
+  const observe=observeQuota(h,a); assert.equal(await observe(completeEvent),true)
+  h.answers['session.transcript']=(r,m,{cursor})=>cursor==='p2'
+    ?{rows:[...toolRows(84),{...user(43),display_kind:'hidden'}],next_cursor:'p3'}
+    :cursor==='p3'?{rows:[user()],next_cursor:null}:{rows:toolRows(100),next_cursor:'p2'}
+  assert.equal(await observe(completeEvent),false)
+  h.answers['model.options']=inventory([win('Session',0,due+5*60*M)])
+  h.now=due+M-3000; await a.tick(); h.now=due+M; await a.tick()
+  assert.equal(sendCalls(h).length,0); assert.equal((await a.read()).jobs[0].status,'superseded')
+  assert(!readCursors(h).includes('p3'))
+})
+
+test('partial, stale or inconsistent transcript reads fail closed',async t=>{
+  for(const [name,read,count] of [
+    ['unchanged cursor',(r,m,{cursor})=>({rows:toolRows(60),next_cursor:'p2'}),2],
+    ['cursor reset',(r,m,{cursor})=>({rows:[user()],reset:true,next_cursor:null,...(!cursor?{rows:toolRows(60),next_cursor:'p2'}:{})}),2],
+    ['episode mismatch',(r,m,{cursor})=>({rows:[user()],session_id:'somewhere-else'}),1],
+    ['page budget',(r,m,{cursor})=>({rows:toolRows(60),next_cursor:String(Number(cursor ?? 0)+1)}),8],
+    ['changed head',(()=>{let heads=0;return (r,m,{cursor})=>cursor?{rows:[user()],next_cursor:null}
+      :{rows:heads++%2===0?toolRows(100):[user(43)],next_cursor:'p2'}})(),3],
+  ]) await t.test(name,async()=>{
+    const h=quotaHarness(read), a=h.getScheduler(); await a.enable(true); await a.tick(base)
+    await assert.rejects(observeQuota(h,a)(completeEvent),/完整核对/)
+    assert.equal((await a.read()).jobs.length,0)
+    assert.equal(readCursors(h).length,count)
+    await a.enqueue(job({kind:'retry',userRow:42})); h.answers['model.options']=inventory([win('Session',0,due+5*60*M)])
+    h.now=due-3000; await a.tick(); h.now=due; await a.tick()
+    assert.equal(sendCalls(h).length,0); assert.equal((await a.read()).jobs[0].status,'review')
+  })
+})
 test('disabled auto retry becomes manual-reviewable; cancel erases full local copy',async()=>{
   const h=createHarness(), a=h.getScheduler(); await a.enable(true); await a.enqueue(job({kind:'retry'})); await a.enable(false)
   assert.equal((await a.read()).jobs[0].status,'missed'); await a.cancel('j'); const j=(await a.read()).jobs[0]
